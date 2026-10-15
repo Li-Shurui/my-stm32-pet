@@ -1,30 +1,35 @@
 /*
- * pet.c - a desktop pet for the ATK-MP157 (STM32MP157) RGB screen. v4
+ * pet.c - a desktop pet for the ATK-MP157 (STM32MP157) RGB screen. v5
  *
  * Architecture (validated with probe.c):
  *   - /dev/dri/card0, DRM master
  *   - the currently unused overlay plane (crtc_id == 0) is driven with the
  *     classic SETPLANE ioctl, ARGB8888 dumb buffer, double buffered
  *   - the plane covers the whole screen; only the pet, the butterfly, the
- *     food and the launcher icon have non-zero alpha, so the ALIENTEK Qt
- *     desktop shows through everywhere else - nothing else is disturbed
+ *     food, the particles and the launcher icon have non-zero alpha, so the
+ *     ALIENTEK Qt desktop shows through everywhere else
  *   - touch input comes straight from /dev/input/event0 (Goodix GT9147)
  *
  * Two modes:
  *   LAUNCHER - a cat-face app icon sits in the bottom-right corner. The
  *              touchscreen is NOT grabbed, so the Qt desktop stays fully
  *              usable. Tap the icon to launch the pet.
- *   PET      - the pet is alive and grabs the touchscreen exclusively, so
- *              touching it never reaches the UI behind it.
+ *   PET      - the pet is alive and grabs the touchscreen exclusively.
  *
- * Pet interactions:
- *   tap the pet        -> hop + hearts (3 quick taps -> it falls asleep)
+ * Touch interactions:
+ *   tap the pet        -> hop + hearts (3 quick taps -> it exits)
+ *   long-press 1.5s    -> it falls asleep (touchscreen back to desktop)
  *   drag the pet       -> it follows your finger
  *   tap the desktop    -> drops cat food; the pet walks over and eats
  *   a butterfly        -> flutters by now and then; the pet may chase it
- *   long-press 1.2s    -> the pet exits back to the launcher icon
- *   asleep             -> grab released; the desktop is usable again,
- *                         touching the pet wakes it
+ *   asleep             -> grab released; desktop usable; tap it to wake
+ *
+ * Serial console control (petctl -> /run/pet.cmd FIFO):
+ *   summon | exit | sleep | wake | dance | happy | food [x y] |
+ *   butterfly | goto x y | status | help
+ *
+ * Eye candy: paw-print trail, state aura, sparkle/star/note particles,
+ * summon shockwave ring, exit poof, dance routine.
  *
  * Build: arm-linux-gnueabihf-gcc -static -Os -o pet pet.c -lm
  * Stop:  Ctrl-C / SIGTERM (plane is detached cleanly on exit)
@@ -43,6 +48,7 @@
 #include <math.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/file.h>
 #include <linux/input.h>
 #include <drm/drm.h>
@@ -61,6 +67,7 @@
 #define ICON_SZ    76
 #define FPS        12
 #define FRAME_NS   (1000000000L / FPS)
+#define CMD_PATH   "/run/pet.cmd"
 
 /* colours (straight alpha) */
 #define FUR        245, 166,  66
@@ -71,7 +78,7 @@
 #define BELL       255, 214,  80
 
 typedef enum { ST_IDLE, ST_WALK, ST_SIT, ST_SLEEP, ST_DRAG, ST_HAPPY,
-               ST_CHASE, ST_EAT } pet_state;
+               ST_CHASE, ST_EAT, ST_DANCE } pet_state;
 typedef enum { MODE_LAUNCHER, MODE_PET } app_mode;
 
 static volatile sig_atomic_t g_stop = 0;
@@ -86,7 +93,8 @@ typedef struct {
 } surface;
 
 static float PS = PET_SCALE;
-#define SX(v) ((v) * PS)
+static float PS_cur = PET_SCALE;           /* PS * spawn animation scale */
+#define SX(v) ((v) * PS_cur)
 
 static void blend(surface *s, int x, int y, int a, int r, int g, int b)
 {
@@ -167,7 +175,7 @@ typedef struct {
     double idle_time;
     double blink_at, blink_t0;
     double happy_t0, z_t0, sit_t0;
-    double chew_t0;
+    double chew_t0, dance_t0;
     int facing;
     float walk_phase;
     float hop;
@@ -191,6 +199,21 @@ typedef struct {
     bool active;
 } food;
 
+/* paw prints left behind while walking */
+#define MAX_PAWS 14
+typedef struct { float x, y; double t0; int left; bool used; } paw;
+static paw paws[MAX_PAWS];
+static int paw_next = 0;
+static int paw_side = 0;
+static double paw_timer = 0;
+
+/* particles: sparkles, stars, music notes */
+#define MAX_PT 72
+enum { PT_SPARK, PT_STAR, PT_NOTE };
+typedef struct { float x, y, vx, vy; double born; float life; float sz; int kind; } particle;
+static particle pts[MAX_PT];
+static int pt_next = 0;
+
 static double now_s(void)
 {
     struct timespec ts;
@@ -199,6 +222,117 @@ static double now_s(void)
 }
 
 static float frand(void) { return (float)rand() / (float)RAND_MAX; }
+
+static void spawn_particle(double t, float x, float y, float vx, float vy,
+                           float life, float sz, int kind)
+{
+    particle *e = &pts[pt_next];
+    pt_next = (pt_next + 1) % MAX_PT;
+    e->x = x; e->y = y; e->vx = vx; e->vy = vy;
+    e->born = t; e->life = life; e->sz = sz; e->kind = kind;
+}
+
+static void burst_stars(double t, float x, float y, int n)
+{
+    for (int i = 0; i < n; i++) {
+        float a = frand() * 6.283f;
+        float sp = 60 + frand() * 130;
+        spawn_particle(t, x, y, cosf(a) * sp, sinf(a) * sp,
+                       0.5f + frand() * 0.5f, 3.5f + frand() * 3.5f, PT_STAR);
+    }
+}
+
+static void burst_sparks(double t, float x, float y, int n)
+{
+    for (int i = 0; i < n; i++) {
+        float a = frand() * 6.283f;
+        float sp = 25 + frand() * 80;
+        spawn_particle(t, x, y, cosf(a) * sp, sinf(a) * sp - 30,
+                       0.6f + frand() * 0.6f, 2.5f + frand() * 2.5f, PT_SPARK);
+    }
+}
+
+static void spawn_note(double t, float x, float y)
+{
+    spawn_particle(t, x, y, (frand() - 0.5f) * 30, -34 - frand() * 22,
+                   1.6f, 4.5f, PT_NOTE);
+}
+
+/* ------------------------------------------------------------------ */
+/* state aura behind the pet                                           */
+static void draw_aura(surface *s, pet *p, double t)
+{
+    float cx = p->x + PET_W / 2, cy = p->y + PET_H / 2;
+    int r, g, b, a;
+    switch (p->st) {
+    case ST_SLEEP: r = 100; g = 150; b = 255; a = 24; break;
+    case ST_HAPPY: r = 255; g = 120; b = 160; a = 38; break;
+    case ST_DRAG:  r = 120; g = 220; b = 255; a = 32; break;
+    case ST_DANCE:
+        r = (int)(128 + 127 * sinf((float)t * 4.0f));
+        g = (int)(128 + 127 * sinf((float)t * 4.0f + 2.09f));
+        b = (int)(128 + 127 * sinf((float)t * 4.0f + 4.18f));
+        a = 40; break;
+    case ST_CHASE: r = 255; g = 200; b = 100; a = 32; break;
+    default:       r = 255; g = 180; b =  90; a = 28; break;
+    }
+    float pulse = 1.0f + sinf((float)t * 3.0f) * 0.06f;
+    float sc = PS_cur / PS * pulse;
+    ellipse(s, cx, cy + 6, PET_W * 0.60f * sc, PET_H * 0.60f * sc, a, r, g, b);
+}
+
+/* paw prints under the pet */
+static void draw_paws(surface *s, double t)
+{
+    for (int i = 0; i < MAX_PAWS; i++) {
+        paw *w = &paws[i];
+        if (!w->used) continue;
+        float age = (float)(t - w->t0);
+        if (age > 2.6f) { w->used = false; continue; }
+        int a = (int)(120 * (1.0f - age / 2.6f));
+        if (a <= 0) continue;
+        float dx = w->left ? -3.0f : 3.0f;
+        /* pad */
+        ellipse(s, w->x + dx, w->y, 3.6f, 3.0f, a, 120, 85, 50);
+        /* toes */
+        circle(s, w->x + dx - 3.4f, w->y - 3.6f, 1.2f, a, 120, 85, 50);
+        circle(s, w->x + dx,        w->y - 4.4f, 1.2f, a, 120, 85, 50);
+        circle(s, w->x + dx + 3.4f, w->y - 3.6f, 1.2f, a, 120, 85, 50);
+    }
+}
+
+/* particles in front of the pet */
+static void draw_particles(surface *s, double t)
+{
+    for (int i = 0; i < MAX_PT; i++) {
+        particle *e = &pts[i];
+        if (e->life <= 0) continue;
+        float age = (float)(t - e->born);
+        if (age > e->life) { e->life = 0; continue; }
+        float ph = age / e->life;
+        int a = (int)(255 * (1.0f - ph) * (ph < 0.15f ? ph / 0.15f : 1.0f));
+        if (a <= 0) continue;
+        float x = e->x + e->vx * age;
+        float y = e->y + e->vy * age;
+        if (e->kind == PT_SPARK) {
+            float r = e->sz * (0.6f + 0.4f * sinf(age * 20.0f));
+            seg(s, x - r, y, x + r, y, 1.2f, a, 255, 230, 120);
+            seg(s, x, y - r, x, y + r, 1.2f, a, 255, 230, 120);
+            circle(s, x, y, 1.2f, a, 255, 255, 220);
+        } else if (e->kind == PT_STAR) {
+            float r = e->sz * (1.0f - ph * 0.5f);
+            for (int k = 0; k < 4; k++) {
+                float ang = k * 3.14159f / 4 + age * 3.0f;
+                seg(s, x, y, x + cosf(ang) * r, y + sinf(ang) * r, 1.6f, a, 255, 255, 255);
+            }
+            circle(s, x, y, 2.0f, a, 255, 240, 200);
+        } else { /* PT_NOTE */
+            circle(s, x, y + 3, 2.6f, a, 190, 150, 255);
+            seg(s, x + 2.2f, y + 3, x + 2.2f, y - 5, 1.3f, a, 190, 150, 255);
+            seg(s, x + 2.2f, y - 5, x + 5.5f, y - 3, 1.3f, a, 190, 150, 255);
+        }
+    }
+}
 
 /* ------------------------------------------------------------------ */
 /* the launcher icon: a round app button with a cat face               */
@@ -210,21 +344,18 @@ static void draw_launcher_icon(surface *s, double t)
     float cx = icon_x + ICON_SZ / 2, cy = icon_y + ICON_SZ / 2;
     float R = ICON_SZ / 2 * pulse;
 
-    /* drop shadow */
+    /* soft glow ring */
+    circle(s, cx, cy, R + 5 + sinf((float)t * 2.2f) * 2.0f, 40, 255, 200, 120);
     circle(s, cx + 2, cy + 4, R, 70, 0, 0, 0);
-    /* dark round button */
     circle(s, cx, cy, R, 215, 38, 40, 52);
-    circle(s, cx, cy, R, 255, 70, 74, 92);
     circle(s, cx, cy, R - 3, 255, 38, 40, 52);
-    /* cat face */
-    float fr = R * 0.52f;                 /* face radius */
+    float fr = R * 0.52f;
     float fy = cy + R * 0.08f;
     tri(s, cx - fr * 0.85f, fy - fr * 0.55f, cx - fr * 0.38f, fy - fr * 1.35f, cx - fr * 0.05f, fy - fr * 0.55f, 255, FUR_DARK);
     tri(s, cx + fr * 0.85f, fy - fr * 0.55f, cx + fr * 0.38f, fy - fr * 1.35f, cx + fr * 0.05f, fy - fr * 0.55f, 255, FUR_DARK);
     tri(s, cx - fr * 0.68f, fy - fr * 0.58f, cx - fr * 0.38f, fy - fr * 1.12f, cx - fr * 0.22f, fy - fr * 0.58f, 255, 255, 170, 185);
     tri(s, cx + fr * 0.68f, fy - fr * 0.58f, cx + fr * 0.38f, fy - fr * 1.12f, cx + fr * 0.22f, fy - fr * 0.58f, 255, 255, 170, 185);
     circle(s, cx, fy + fr * 0.1f, fr, 255, FUR);
-    /* eyes (blink slowly) */
     bool blink = fmodf((float)t, 3.7f) < 0.12f;
     if (blink) {
         seg(s, cx - fr * 0.55f, fy - fr * 0.1f, cx - fr * 0.15f, fy - fr * 0.1f, R * 0.045f, 255, EYE);
@@ -235,11 +366,9 @@ static void draw_launcher_icon(surface *s, double t)
         circle(s, cx - fr * 0.38f, fy - fr * 0.17f, R * 0.032f, 235, 255, 255, 255);
         circle(s, cx + fr * 0.32f, fy - fr * 0.17f, R * 0.032f, 235, 255, 255, 255);
     }
-    /* nose + w mouth */
     tri(s, cx - R * 0.035f, fy + fr * 0.22f, cx + R * 0.035f, fy + fr * 0.22f, cx, fy + fr * 0.36f, 255, 70, 55, 55);
     seg(s, cx - R * 0.07f, fy + fr * 0.45f, cx - R * 0.02f, fy + fr * 0.58f, R * 0.028f, 230, 90, 60, 60);
     seg(s, cx + R * 0.07f, fy + fr * 0.45f, cx + R * 0.02f, fy + fr * 0.58f, R * 0.028f, 230, 90, 60, 60);
-    /* whiskers */
     seg(s, cx - fr * 0.75f, fy + fr * 0.25f, cx - fr * 1.25f, fy + fr * 0.12f, R * 0.022f, 160, 255, 255, 255);
     seg(s, cx - fr * 0.75f, fy + fr * 0.4f, cx - fr * 1.25f, fy + fr * 0.48f, R * 0.022f, 160, 255, 255, 255);
     seg(s, cx + fr * 0.75f, fy + fr * 0.25f, cx + fr * 1.25f, fy + fr * 0.12f, R * 0.022f, 160, 255, 255, 255);
@@ -251,8 +380,11 @@ static void draw_pet(surface *s, pet *p, double t)
 {
     float ox = p->x, oy = p->y;
     float bob = 0.0f;
+    bool dancing = (p->st == ST_DANCE);
 
-    if (p->st == ST_WALK || p->st == ST_CHASE)
+    if (dancing)
+        bob = sinf(p->walk_phase * 3.0f) * 3.0f;
+    else if (p->st == ST_WALK || p->st == ST_CHASE)
         bob = sinf(p->walk_phase * 2) * 2.5f;
     else if (p->st == ST_SLEEP)
         bob = sinf((float)t * 1.2f) * 1.5f;
@@ -270,7 +402,8 @@ static void draw_pet(surface *s, pet *p, double t)
     if (sitting) cy += SX(5);
 
     /* tail */
-    float wag = sinf((float)t * (p->st == ST_WALK || p->st == ST_CHASE ? 7.0f : 2.2f)) * 0.5f;
+    float wag = sinf((float)t * (p->st == ST_WALK || p->st == ST_CHASE ? 7.0f :
+                                 (dancing ? 12.0f : 2.2f))) * (dancing ? 0.9f : 0.5f);
     float tdir = p->facing;
     float bx = cx + SX(26) * tdir, by = cy + SX(12);
     float mx = bx + SX(16) * tdir, my = by - SX(10) + wag * SX(8);
@@ -305,7 +438,7 @@ static void draw_pet(surface *s, pet *p, double t)
     }
 
     /* ears */
-    float et = p->facing * SX(4) + p->ear_twitch * SX(3);
+    float et = p->facing * SX(4) + p->ear_twitch * SX(3) + (dancing ? sinf((float)t * 16) * SX(3) : 0);
     tri(s, cx - SX(24), cy - SX(18), cx - SX(10) + et, cy - SX(40), cx - SX(4), cy - SX(16), 255, FUR_DARK);
     tri(s, cx + SX(24), cy - SX(18), cx + SX(10) + et, cy - SX(40), cx + SX(4), cy - SX(16), 255, FUR_DARK);
     tri(s, cx - SX(19), cy - SX(19), cx - SX(10) + et, cy - SX(33), cx - SX(9), cy - SX(19), 255, 255, 170, 185);
@@ -336,6 +469,10 @@ static void draw_pet(surface *s, pet *p, double t)
             seg(s, ex_l + SX(2), ey_y - SX(4), ex_l + SX(6), ey_y + SX(1), SX(1.2f), 200, EYE);
             seg(s, ex_r - SX(2), ey_y - SX(4), ex_r - SX(6), ey_y + SX(1), SX(1.2f), 200, EYE);
         }
+    } else if (dancing) {
+        /* >_< happy squint while dancing */
+        seg(s, ex_l - SX(5), ey_y - SX(2), ex_l + SX(5), ey_y + SX(2), SX(1.8f), 255, EYE);
+        seg(s, ex_r - SX(5), ey_y - SX(2), ex_r + SX(5), ey_y + SX(2), SX(1.8f), 255, EYE);
     } else {
         circle(s, ex_l, ey_y, SX(6), 255, EYE);
         circle(s, ex_r, ey_y, SX(6), 255, EYE);
@@ -352,6 +489,8 @@ static void draw_pet(surface *s, pet *p, double t)
     if (eating) {
         float mo = 2.5f + fabsf(sinf((float)(t - p->chew_t0) * 9.0f)) * 3.0f;
         ellipse(s, cx, cy + SX(10) + mo * 0.3f, SX(4.5f), SX(mo), 235, 120, 60, 60);
+    } else if (dancing) {
+        ellipse(s, cx, cy + SX(11), SX(5.5f), SX(4.5f), 240, 120, 60, 60);
     } else if (p->st == ST_HAPPY || p->st == ST_DRAG) {
         ellipse(s, cx, cy + SX(11), SX(4.5f), SX(3.5f), 230, 120, 60, 60);
     } else if (sleeping) {
@@ -651,6 +790,197 @@ static void touch_poll(int fd, touch_t *t, bool *pressed, bool *released,
 }
 
 /* ------------------------------------------------------------------ */
+/* global pet state (used by the serial command handler)               */
+static pet p;
+static butterfly bf;
+static food fd_food;
+static app_mode mode = MODE_LAUNCHER;
+static int tfd = -1;
+static float spawn_scale = 1.0f;
+static int exiting = 0;
+static double summon_t0 = -100;
+static double bf_respawn;
+
+static void summon_pet(double t)
+{
+    if (mode != MODE_LAUNCHER) return;
+    mode = MODE_PET;
+    fd_food.active = false;
+    p.x = icon_x + ICON_SZ / 2 - PET_W / 2;
+    p.y = icon_y + ICON_SZ / 2 - PET_H / 2;
+    p.tx = p.x; p.ty = p.y;
+    p.st = ST_HAPPY;
+    p.happy_t0 = t;
+    p.state_time = 0;
+    p.idle_time = 0;
+    p.dragging = false;
+    spawn_scale = 0.15f;
+    summon_t0 = t;
+    set_grab(tfd, 1);
+    burst_sparks(t, p.x + PET_W / 2, p.y + PET_H / 2, 10);
+    fprintf(stderr, "pet: hello! (long-press me to sleep, tap me 3x to send me back)\n");
+}
+
+static void begin_exit(double t)
+{
+    if (mode != MODE_PET || exiting) return;
+    exiting = 1;
+    burst_sparks(t, p.x + PET_W / 2, p.y + PET_H / 2, 14);
+    fprintf(stderr, "pet: bye! tap the icon to call me again\n");
+}
+
+static void do_sleep(double t)
+{
+    if (mode != MODE_PET || p.st == ST_SLEEP) return;
+    p.st = ST_SLEEP;
+    p.z_t0 = t;
+    p.state_time = 0;
+    p.dragging = false;
+    set_grab(tfd, 0);
+    fprintf(stderr, "pet: zzz... (desktop usable, tap me to wake)\n");
+}
+
+static void do_wake(double t)
+{
+    if (mode != MODE_PET || p.st != ST_SLEEP) return;
+    p.st = ST_HAPPY;
+    p.happy_t0 = t;
+    p.state_time = 0;
+    p.idle_time = 0;
+    set_grab(tfd, 1);
+    fprintf(stderr, "pet: good morning!\n");
+}
+
+static void do_dance(double t)
+{
+    if (mode != MODE_PET) return;
+    p.st = ST_DANCE;
+    p.dance_t0 = t;
+    p.state_time = 0;
+    p.dragging = false;
+    fprintf(stderr, "pet: dancing!\n");
+}
+
+static void do_happy(double t)
+{
+    if (mode != MODE_PET) return;
+    p.st = ST_HAPPY;
+    p.happy_t0 = t;
+    p.state_time = 0;
+    fprintf(stderr, "pet: happy!\n");
+}
+
+/* ---- serial command line (petctl -> /run/pet.cmd FIFO) ---- */
+static int cmd_fd = -1;
+static char cmd_line[256];
+static int cmd_len = 0;
+
+static void cmd_open(void)
+{
+    mkfifo(CMD_PATH, 0666);
+    cmd_fd = open(CMD_PATH, O_RDWR | O_NONBLOCK);
+    if (cmd_fd >= 0)
+        fprintf(stderr, "pet: command fifo %s ready (try: petctl help)\n", CMD_PATH);
+}
+
+static void handle_command(double t, char *cmd)
+{
+    char *argv[8];
+    int argc = 0;
+    char *tok = strtok(cmd, " \t\r\n");
+    while (tok && argc < 8) { argv[argc++] = tok; tok = strtok(NULL, " \t\r\n"); }
+    if (argc == 0) return;
+
+    if (!strcmp(argv[0], "summon") || !strcmp(argv[0], "on") || !strcmp(argv[0], "start")) {
+        summon_pet(t);
+    } else if (!strcmp(argv[0], "exit") || !strcmp(argv[0], "off") || !strcmp(argv[0], "bye")) {
+        begin_exit(t);
+    } else if (!strcmp(argv[0], "sleep") || !strcmp(argv[0], "nap")) {
+        do_sleep(t);
+    } else if (!strcmp(argv[0], "wake") || !strcmp(argv[0], "up")) {
+        do_wake(t);
+    } else if (!strcmp(argv[0], "dance")) {
+        do_dance(t);
+    } else if (!strcmp(argv[0], "happy") || !strcmp(argv[0], "pat")) {
+        do_happy(t);
+    } else if (!strcmp(argv[0], "food")) {
+        if (mode != MODE_PET) { fprintf(stderr, "pet: not summoned\n"); return; }
+        if (argc >= 3) {
+            fd_food.x = atoi(argv[1]);
+            fd_food.y = atoi(argv[2]);
+        } else {
+            fd_food.x = 80 + frand() * (screen_w - 160);
+            fd_food.y = 80 + frand() * (screen_h - 200);
+        }
+        fd_food.amount = 1.0f;
+        fd_food.active = true;
+        if (p.st != ST_WALK && p.st != ST_EAT && p.st != ST_DRAG && p.st != ST_DANCE) {
+            p.st = ST_WALK;
+            p.state_time = 0;
+        }
+        fprintf(stderr, "pet: food at %d,%d\n", (int)fd_food.x, (int)fd_food.y);
+    } else if (!strcmp(argv[0], "butterfly")) {
+        bf.alive = true;
+        bf.born = t;
+        bf.phase = frand() * 6.28f;
+        bf.x = frand() * screen_w * 0.5f;
+        bf.y = 60 + frand() * (screen_h - 200);
+        bf.vx = 40 + frand() * 40;
+        bf.vy = (frand() - 0.5f) * 30;
+        bf_respawn = t + 10 + frand() * 10;
+        fprintf(stderr, "pet: a butterfly appears!\n");
+    } else if (!strcmp(argv[0], "goto") && argc >= 3) {
+        if (mode != MODE_PET) { fprintf(stderr, "pet: not summoned\n"); return; }
+        p.tx = atoi(argv[1]);
+        p.ty = atoi(argv[2]);
+        p.st = ST_WALK;
+        p.state_time = 0;
+        p.dragging = false;
+        fprintf(stderr, "pet: walk to %d,%d\n", (int)p.tx, (int)p.ty);
+    } else if (!strcmp(argv[0], "status")) {
+        const char *st = "?";
+        switch (p.st) {
+        case ST_IDLE: st = "idle"; break;
+        case ST_WALK: st = "walk"; break;
+        case ST_SIT: st = "sit"; break;
+        case ST_SLEEP: st = "sleep"; break;
+        case ST_DRAG: st = "drag"; break;
+        case ST_HAPPY: st = "happy"; break;
+        case ST_CHASE: st = "chase"; break;
+        case ST_EAT: st = "eat"; break;
+        case ST_DANCE: st = "dance"; break;
+        }
+        fprintf(stderr, "pet: mode=%s state=%s pos=%d,%d grab=%s\n",
+                mode == MODE_PET ? "pet" : "launcher", st,
+                (int)p.x, (int)p.y, g_grabbed ? "on" : "off");
+    } else if (!strcmp(argv[0], "help") || !strcmp(argv[0], "?")) {
+        fprintf(stderr,
+            "pet: commands: summon | exit | sleep | wake | dance | happy | "
+            "food [x y] | butterfly | goto x y | status | help\n");
+    } else {
+        fprintf(stderr, "pet: unknown command '%s' (try: petctl help)\n", argv[0]);
+    }
+}
+
+static void cmd_poll(double t)
+{
+    if (cmd_fd < 0) { cmd_open(); return; }
+    char buf[256];
+    ssize_t n = read(cmd_fd, buf, sizeof(buf) - 1);
+    if (n <= 0) return;
+    buf[n] = 0;
+    for (ssize_t i = 0; i < n; i++) {
+        if (buf[i] == '\n') {
+            cmd_line[cmd_len] = 0;
+            if (cmd_len > 0) handle_command(t, cmd_line);
+            cmd_len = 0;
+        } else if (cmd_len < (int)sizeof(cmd_line) - 1) {
+            cmd_line[cmd_len++] = buf[i];
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
 int main(void)
 {
     int lock_fd = open("/tmp/.pet.lock", O_CREAT | O_RDWR, 0666);
@@ -663,12 +993,12 @@ int main(void)
     srand((unsigned)time(NULL));
 
     if (drm_setup() < 0) return 1;
-    int tfd = touch_open();
+    tfd = touch_open();
+    cmd_open();
 
     icon_x = (float)(screen_w - ICON_SZ - 24);
     icon_y = (float)(screen_h - ICON_SZ - 24);
 
-    pet p;
     memset(&p, 0, sizeof(p));
     p.x = screen_w / 2 - PET_W / 2;
     p.y = screen_h - PET_H - 24;
@@ -678,18 +1008,16 @@ int main(void)
     p.squash = 1.0f;
     p.facing = 1;
 
-    butterfly bf;
     memset(&bf, 0, sizeof(bf));
     bf.born = -100;
-    double bf_respawn = now_s() + 6.0 + frand() * 8.0;
+    bf_respawn = now_s() + 6.0 + frand() * 8.0;
 
-    food fd;
-    memset(&fd, 0, sizeof(fd));
+    memset(&fd_food, 0, sizeof(fd_food));
 
-    app_mode mode = MODE_LAUNCHER;
     touch_t ts = { false, 0, 0 };
     bool pressed = false, released = false;
-    bool want_exit = false;
+    bool want_sleep = false;
+    bool woke = false;
     int down_x = 0, down_y = 0;
     double down_t = 0;
     int tap_count = 0;
@@ -698,7 +1026,7 @@ int main(void)
     surface surf = { fb_ptr[0], (int)(fb_pitch[0] / 4), screen_w, screen_h };
     double t_prev = now_s();
 
-    fprintf(stderr, "pet: launcher icon ready - tap it to summon the pet!\n");
+    fprintf(stderr, "pet: launcher icon ready - tap it (or: petctl summon)\n");
 
     while (!g_stop) {
         double t = now_s();
@@ -709,6 +1037,7 @@ int main(void)
         pressed = released = false;
         if (tfd >= 0)
             touch_poll(tfd, &ts, &pressed, &released, &down_x, &down_y, &down_t, t);
+        cmd_poll(t);
 
         p.state_time += dt;
         p.idle_time += dt;
@@ -721,25 +1050,31 @@ int main(void)
             p.blink_at = t + 2.5 + frand() * 3.0;
         }
 
+        /* spawn/exit animation */
+        if (mode == MODE_PET && !exiting && spawn_scale < 1.0f) {
+            spawn_scale += (1.0f - spawn_scale) * dt * 5.0f;
+            if (spawn_scale > 0.999f) spawn_scale = 1.0f;
+        }
+        if (exiting) {
+            spawn_scale -= dt * 3.2f;
+            if (spawn_scale <= 0.1f) {
+                spawn_scale = 1.0f;
+                exiting = 0;
+                mode = MODE_LAUNCHER;
+                set_grab(tfd, 0);
+                p.st = ST_IDLE;
+                p.state_time = 0;
+            }
+        }
+        PS_cur = PS * spawn_scale;
+
         /* ================= LAUNCHER MODE ================= */
         if (mode == MODE_LAUNCHER) {
             if (pressed) {
                 if (down_x >= icon_x - 6 && down_x <= icon_x + ICON_SZ + 6 &&
                     down_y >= icon_y - 6 && down_y <= icon_y + ICON_SZ + 6) {
-                    /* summon the pet right out of the icon */
-                    mode = MODE_PET;
-                    fd.active = false;
-                    p.x = icon_x + ICON_SZ / 2 - PET_W / 2;
-                    p.y = icon_y + ICON_SZ / 2 - PET_H / 2;
-                    p.tx = p.x; p.ty = p.y;
-                    p.st = ST_HAPPY;
-                    p.happy_t0 = t;
-                    p.state_time = 0;
-                    p.idle_time = 0;
-                    set_grab(tfd, 1);
-                    fprintf(stderr, "pet: hello! (long-press me to send me back)\n");
+                    summon_pet(t);
                 }
-                /* other touches belong to the desktop */
             }
         }
 
@@ -749,7 +1084,6 @@ int main(void)
             if (pressed) {
                 p.idle_time = 0;
                 if (p.st == ST_SLEEP) {
-                    /* asleep + ungranted: only a touch on the pet wakes it */
                     if (down_x >= p.x - 10 && down_x <= p.x + PET_W + 10 &&
                         down_y >= p.y - 10 && down_y <= p.y + PET_H + 10) {
                         set_grab(tfd, 1);
@@ -757,6 +1091,7 @@ int main(void)
                         p.dragging = true;
                         p.grab_dx = (float)down_x - p.x;
                         p.grab_dy = (float)down_y - p.y;
+                        woke = true;
                     }
                 } else if (down_x >= p.x - 10 && down_x <= p.x + PET_W + 10 &&
                            down_y >= p.y - 10 && down_y <= p.y + PET_H + 10) {
@@ -765,10 +1100,10 @@ int main(void)
                     p.grab_dx = (float)down_x - p.x;
                     p.grab_dy = (float)down_y - p.y;
                 } else {
-                    fd.x = (float)down_x;
-                    fd.y = (float)down_y;
-                    fd.amount = 1.0f;
-                    fd.active = true;
+                    fd_food.x = (float)down_x;
+                    fd_food.y = (float)down_y;
+                    fd_food.amount = 1.0f;
+                    fd_food.active = true;
                     if (p.st != ST_WALK && p.st != ST_EAT) {
                         p.st = ST_WALK;
                         p.state_time = 0;
@@ -779,28 +1114,27 @@ int main(void)
             if (released) {
                 if (p.dragging) {
                     p.dragging = false;
-                    if (want_exit) {
-                        /* long-pressed: back to the launcher icon */
-                        mode = MODE_LAUNCHER;
-                        set_grab(tfd, 0);
-                        p.st = ST_IDLE;
-                        p.state_time = 0;
-                        fd.active = false;
-                        want_exit = false;
-                        tap_count = 0;
-                        fprintf(stderr, "pet: bye! tap the icon to call me again\n");
+                    if (woke) {
+                        woke = false;
+                        if (t - down_t < 0.45f) {
+                            p.st = ST_HAPPY;
+                            p.happy_t0 = t;
+                            p.state_time = 0;
+                        } else {
+                            p.st = ST_IDLE;
+                            p.state_time = 0;
+                        }
+                    } else if (want_sleep) {
+                        /* long-press -> sleep */
+                        do_sleep(t);
                     } else if (t - down_t < 0.45f) {
-                        /* a tap on the pet: hop, or sleep after 3 quick taps */
+                        /* quick tap: 3 in a row -> exit */
                         if (t - last_tap_t < 0.9f) tap_count++;
                         else tap_count = 1;
                         last_tap_t = t;
                         if (tap_count >= 3) {
-                            p.st = ST_SLEEP;
-                            p.z_t0 = t;
-                            p.state_time = 0;
                             tap_count = 0;
-                            set_grab(tfd, 0);
-                            fprintf(stderr, "pet: zzz... (desktop usable, tap me to wake)\n");
+                            begin_exit(t);
                         } else {
                             p.st = ST_HAPPY;
                             p.happy_t0 = t;
@@ -812,7 +1146,7 @@ int main(void)
                     }
                 }
                 p.idle_time = 0;
-                want_exit = false;
+                want_sleep = false;
             }
 
             /* ---- butterfly lifecycle ---- */
@@ -843,6 +1177,25 @@ int main(void)
                 if (bf.x < -40 || bf.x > screen_w + 40)
                     bf.alive = false;
             }
+
+            /* ---- paw prints while walking ---- */
+            if ((p.st == ST_WALK || p.st == ST_CHASE) && t - paw_timer > 0.3) {
+                paw_timer = t;
+                paw *w = &paws[paw_next];
+                paw_next = (paw_next + 1) % MAX_PAWS;
+                w->x = p.x + PET_W / 2 - p.facing * 24;
+                w->y = p.y + PET_H - 10;
+                w->t0 = t;
+                w->left = (paw_side++ & 1);
+                w->used = true;
+            }
+
+            /* ---- sparkles while happy ---- */
+            if (p.st == ST_HAPPY && frand() < 0.35f)
+                spawn_particle(t, p.x + PET_W / 2 + (frand() - 0.5f) * PET_W * 0.8f,
+                               p.y + PET_H / 2 + (frand() - 0.5f) * PET_H * 0.8f,
+                               (frand() - 0.5f) * 40, -30 - frand() * 30,
+                               0.7f, 3.0f, PT_SPARK);
 
             /* ---- pet state machine ---- */
             float pet_cx = p.x + PET_W / 2, pet_cy = p.y + PET_H / 2;
@@ -877,12 +1230,12 @@ int main(void)
                 break;
 
             case ST_WALK: {
-                float gx = fd.active ? fd.x - PET_W / 2 : p.tx;
-                float gy = fd.active ? fd.y - PET_H / 2 : p.ty;
+                float gx = fd_food.active ? fd_food.x - PET_W / 2 : p.tx;
+                float gy = fd_food.active ? fd_food.y - PET_H / 2 : p.ty;
                 float dx = gx - p.x, dy = gy - p.y;
                 float dist = sqrtf(dx * dx + dy * dy);
                 if (dist < 4.0f) {
-                    if (fd.active) {
+                    if (fd_food.active) {
                         p.st = ST_EAT; p.chew_t0 = t; p.state_time = 0;
                         fprintf(stderr, "pet: eating\n");
                     } else {
@@ -918,8 +1271,8 @@ int main(void)
                 p.y = (float)ts.y - p.grab_dy;
                 p.look_x = ts.x > pet_cx ? 1 : -1;
                 p.look_y = ts.y > pet_cy ? 1 : -1;
-                if (t - down_t > 1.2f)
-                    want_exit = true;      /* hold the pet to send it back */
+                if (t - down_t > 1.5f)
+                    want_sleep = true;      /* long-press -> sleep */
                 break;
 
             case ST_HAPPY:
@@ -929,6 +1282,28 @@ int main(void)
                     p.st = ST_IDLE; p.state_time = 0;
                 }
                 break;
+
+            case ST_DANCE: {
+                float el = (float)(t - p.dance_t0);
+                p.hop = fabsf(sinf(el * 7.0f)) * 16.0f;
+                p.squash = 1.0f + sinf(el * 18.0f) * 0.08f;
+                if (fmodf(el, 0.45f) < dt) p.facing = -p.facing;   /* spin */
+                if (fmodf(el, 0.22f) < dt)
+                    spawn_note(t, p.x + PET_W / 2 + (frand() - 0.5f) * PET_W * 0.6f,
+                               p.y + PET_H * 0.25f);
+                if (frand() < 0.2f)
+                    spawn_particle(t, p.x + PET_W / 2 + (frand() - 0.5f) * PET_W,
+                                   p.y + PET_H / 2 + (frand() - 0.5f) * PET_H,
+                                   (frand() - 0.5f) * 60, -40 - frand() * 40,
+                                   0.8f, 3.0f, PT_SPARK);
+                if (p.state_time > 6.0f) {
+                    p.st = ST_HAPPY;
+                    p.happy_t0 = t;
+                    p.state_time = 0;
+                    burst_sparks(t, p.x + PET_W / 2, p.y + PET_H / 2, 12);
+                }
+                break;
+            }
 
             case ST_CHASE: {
                 if (!bf.alive) {
@@ -943,6 +1318,7 @@ int main(void)
                     p.st = ST_HAPPY;
                     p.happy_t0 = t;
                     p.state_time = 0;
+                    burst_stars(t, bf.x, bf.y, 14);
                     fprintf(stderr, "pet: caught the butterfly!\n");
                 } else {
                     float sp = (110.0f + dist * 0.15f) * dt;
@@ -958,20 +1334,21 @@ int main(void)
             }
 
             case ST_EAT: {
-                p.look_x = fd.x > pet_cx ? 1 : -1;
+                p.look_x = fd_food.x > pet_cx ? 1 : -1;
                 p.look_y = 1;
                 if (frand() < 0.05f) p.ear_twitch = (frand() - 0.5f) * 1.5f;
-                fd.amount -= dt * 0.45f;
-                if (fd.amount <= 0.05f) {
-                    fd.active = false;
-                    fd.amount = 0;
+                fd_food.amount -= dt * 0.45f;
+                if (fd_food.amount <= 0.05f) {
+                    fd_food.active = false;
+                    fd_food.amount = 0;
                     p.st = ST_HAPPY;
                     p.happy_t0 = t;
                     p.state_time = 0;
                     p.idle_time = 0;
+                    burst_sparks(t, fd_food.x, fd_food.y - 10, 8);
                     fprintf(stderr, "pet: yummy!\n");
                 } else if (p.state_time > 25.0f) {
-                    fd.active = false;
+                    fd_food.active = false;
                     p.st = ST_IDLE; p.state_time = 0;
                 }
                 break;
@@ -985,16 +1362,35 @@ int main(void)
             if (p.y > screen_h - PET_H) p.y = screen_h - PET_H;
         }
 
-        p.squash = 1.0f + sinf((float)t * 2.0f) * 0.025f;
+        p.squash = (p.st == ST_DANCE)
+            ? 1.0f + sinf((float)t * 18.0f) * 0.08f
+            : 1.0f + sinf((float)t * 2.0f) * 0.025f;
 
         /* ---- render ---- */
         surf.px = fb_ptr[cur_buf];
         surf.stride = (int)(fb_pitch[cur_buf] / 4);
         memset(surf.px, 0, (size_t)fb_pitch[cur_buf] * screen_h);
         if (mode == MODE_PET) {
-            draw_food(&surf, &fd);
+            draw_paws(&surf, t);
+            draw_food(&surf, &fd_food);
             draw_butterfly(&surf, &bf, t);
+            draw_aura(&surf, &p, t);
             draw_pet(&surf, &p, t);
+            draw_particles(&surf, t);
+            /* summon shockwave ring */
+            if (summon_t0 > 0) {
+                float el = (float)(t - summon_t0);
+                if (el > 0.6f) summon_t0 = -100;
+                else {
+                    int a = (int)(200 * (1.0f - el / 0.6f));
+                    float r = 20 + el / 0.6f * 110;
+                    for (int k = 0; k < 24; k++) {
+                        float ang = k * 3.14159f / 12;
+                        circle(&surf, p.x + PET_W / 2 + cosf(ang) * r,
+                               p.y + PET_H / 2 + sinf(ang) * r, 2.2f, a, 255, 220, 150);
+                    }
+                }
+            }
         } else {
             draw_launcher_icon(&surf, t);
         }
