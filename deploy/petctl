@@ -2,7 +2,7 @@
 # petctl - control the ATK-MP157 desktop pet from the serial console.
 #
 # The pet listens on the FIFO /run/pet.cmd (created by the pet service).
-# Replies go to the pet's journal: journalctl -u atk-pet -n 5
+# State replies also land in the pet's journal: journalctl -u atk-pet -n 5
 #
 # Usage: petctl <command> [args]
 FIFO=/run/pet.cmd
@@ -17,6 +17,9 @@ petctl - desktop pet controller
   wake                 wake the pet up
   dance                the pet dances for ~6 seconds
   happy                the pet hops with hearts
+  say [mood|number]    the pet shows a kaomoji speech bubble
+                       (see: petctl list)
+  list                 list all kaomoji (number, mood, content)
   food [x y]           drop cat food at x,y (or a random spot)
   butterfly            release a butterfly
   goto x y             the pet walks to x,y
@@ -25,6 +28,10 @@ petctl - desktop pet controller
 
 examples:
   petctl summon
+  petctl list
+  petctl say happy
+  petctl say love
+  petctl say 7
   petctl dance
   petctl food 500 300
   petctl status
@@ -48,4 +55,26 @@ echo "$*" > "$FIFO" || {
     echo "petctl: failed to write to $FIFO" >&2
     exit 1
 }
+
+# kaomoji feedback straight in the shell
+case "$1" in
+    list)
+        sleep 0.5
+        if [ -f /run/pet.kaomoji ]; then
+            echo "kaomoji list:"
+            cat /run/pet.kaomoji
+        else
+            echo "petctl: no list file (pet busy?)" >&2
+        fi
+        ;;
+    say)
+        sleep 0.5
+        if [ -f /run/pet.last ]; then
+            printf 'pet says: '
+            cat /run/pet.last
+        fi
+        ;;
+    *)
+        ;;
+esac
 exit 0

@@ -1,4 +1,4 @@
-# ATK-MP157 桌面宠物（Desktop Pet）v5
+# ATK-MP157 桌面宠物（Desktop Pet）v6
 
 在正点原子 ATK-MP157（STM32MP157C，Linux 5.4 + OpenSTLinux Weston）的 7" RGB 屏
 （1024×600）上运行的程序化绘制桌面宠物。**不需要 Qt、不需要 GPU、不需要在板子上装
@@ -22,8 +22,7 @@
 
 ## 串口命令行控制（petctl）
 
-宠物运行时会创建命令管道 `/run/pet.cmd`，在串口 shell 里用 `petctl` 控制
-（回复打印到 journal：`journalctl -u atk-pet -n 5`）：
+宠物运行时会创建命令管道 `/run/pet.cmd`，在串口 shell 里用 `petctl` 控制：
 
 ```sh
 petctl summon      # 召唤宠物（带出场动画）
@@ -31,12 +30,37 @@ petctl dance       # 跳舞 ~6 秒（扭动+旋转+蹦跳+飘音符）
 petctl happy       # 开心跳一下
 petctl sleep       # 休眠（释放触摸屏）
 petctl wake        # 唤醒（接管触摸屏）
+petctl say [mood|编号]   # 说颜文字（见 petctl list）
+petctl list        # 列出全部 25 个颜文字（编号/心情/内容）
 petctl food 500 300  # 在 (500,300) 放猫粮（不带坐标则随机）
 petctl butterfly   # 放一只蝴蝶
 petctl goto 800 200   # 让宠物走到 (800,200)
 petctl status      # 查看 mode/state/位置/触摸独占状态
 petctl help        # 帮助
 ```
+
+颜文字心情：`greet happy love cute sleepy hmm smug angry sad shock cheer`，
+也可以直接给编号（0-24）。`say` 执行后 shell 会立即回显宠物说的内容。
+
+## 颜文字对话框
+
+宠物头顶（靠近屏幕上沿时改在脚下）会弹出带小尾巴的气泡，里面是预渲染的颜文字
+位图。**触发时机**：
+
+| 时机 | 内容 |
+|---|---|
+| 召唤 / 醒来 | 打招呼 |
+| 点它（开心时） | 开心/可爱系列 |
+| 休眠 | 困倦系列 |
+| 吃到猫粮 | 可爱系列 |
+| 扑到蝴蝶 | 惊讶系列 |
+| 跳舞 | 加油系列 |
+| 闲逛时随机 | 任意一个 |
+| `petctl say xxx` | 指定心情/编号 |
+
+气泡有弹出（轻微过冲）和淡出动画，约 2.8 秒。颜文字位图由 `tools/gen_kaomoji.py`
+在 PC 端用字体链（MS Gothic→雅黑→宋体→Segoe UI Symbol，逐字符回退、缺字检测）
+渲染成 alpha 位图嵌入程序（共 52KB），所以板子上不需要任何字体。
 
 ## 视觉特效
 
@@ -45,6 +69,7 @@ petctl help        # 帮助
 - 🐾 **走路脚印**：走路/追逐时身后留下左右交替、淡出的爪印
 - 🌈 **状态光晕**：宠物身后有随状态变色的呼吸光晕（睡=蓝、开心=粉、拖=青、舞=彩虹）
 - 💫 **出场/退场动画**：从图标缩放弹出（带冲击波圆环）、缩回图标（带粒子 puff）
+- 💬 **颜文字气泡**：会说 25 种颜文字（开心/困倦/惊讶/加油……）
 
 ## 技术架构
 
